@@ -1,0 +1,11 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+.cc_build
+*.bak
+*.bak.*
+proxy.log
+.env
+.env.*
+/tmp/proxy_*
