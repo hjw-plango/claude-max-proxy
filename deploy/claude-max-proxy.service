@@ -1,0 +1,34 @@
+[Unit]
+Description=Claude Max -> Anthropic API local proxy gateway
+Documentation=https://github.com/hjw-plango/claude-max-proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/claude-max-proxy
+EnvironmentFile=/etc/claude-max-proxy.env
+ExecStart=/root/claude-max-proxy/venv/bin/python3 /root/claude-max-proxy/proxy.py
+
+# 日志: 同时进 journal 和保留原 proxy.log 文件,方便 tail -f
+StandardOutput=append:/root/claude-max-proxy/proxy.log
+StandardError=append:/root/claude-max-proxy/proxy.log
+
+# 崩溃自动拉起
+Restart=always
+RestartSec=5s
+TimeoutStopSec=10s
+
+# 安全收紧: 不影响功能
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

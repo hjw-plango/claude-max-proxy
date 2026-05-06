@@ -69,6 +69,39 @@ export PROXY_API_KEYS="alice:sk-myproxy-AbCdEf123,bob:sk-myproxy-XyZ789"
 - API key 至少 32 位随机字符串，可用 `python3 -c 'import secrets; print("sk-myproxy-"+secrets.token_urlsafe(24))'` 生成。
 - 日志 `proxy.log` 在 `DEBUG` 模式下可能包含请求体，注意权限和清理。
 
+## 用 systemd 托管（推荐生产部署方式）
+
+`deploy/` 目录提供了 systemd unit 模板：
+
+```bash
+# 1. 复制 unit 文件
+sudo cp deploy/claude-max-proxy.service /etc/systemd/system/
+
+# 2. 复制 env 模板, 填入真实 token (此文件含密钥, chmod 600)
+sudo cp deploy/claude-max-proxy.env.example /etc/claude-max-proxy.env
+sudo chmod 600 /etc/claude-max-proxy.env
+sudo nano /etc/claude-max-proxy.env  # 把 REPLACE_ME 换成真 token
+
+# 3. 启用 + 启动 (开机自启)
+sudo systemctl daemon-reload
+sudo systemctl enable --now claude-max-proxy
+
+# 4. 验证
+sudo systemctl status claude-max-proxy
+curl http://127.0.0.1:5678/health
+```
+
+如果 repo 不在 `/root/claude-max-proxy`，需要修改 `deploy/claude-max-proxy.service` 里的 `WorkingDirectory=` 和 `ExecStart=` 路径。
+
+常用命令：
+
+```bash
+sudo systemctl restart claude-max-proxy   # 改完 env 或代码后重启
+sudo systemctl stop claude-max-proxy      # 停掉
+sudo journalctl -u claude-max-proxy -f    # 看 service 启停事件
+tail -f /root/claude-max-proxy/proxy.log  # 看请求日志
+```
+
 ## 端点
 
 | 端点 | 方法 | 说明 |
