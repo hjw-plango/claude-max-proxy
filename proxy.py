@@ -386,6 +386,22 @@ def proxy_messages():
     except Exception as e:
         return {"error": str(e)}, 400
 
+    # 兼容: 剥掉 OpenAI 协议特有但 Anthropic 拒收的顶层字段
+    # 部分中转工具(如 newapi 转 Cherry Studio OpenAI 请求)只做半套转换,
+    # OpenAI 字段透传过来会被 Anthropic 直接 400. 用黑名单, 不影响 Anthropic 未来的新 beta 字段.
+    _openai_only = {
+        "stream_options", "frequency_penalty", "presence_penalty",
+        "logit_bias", "logprobs", "top_logprobs", "n", "response_format",
+        "seed", "user", "audio", "modalities", "parallel_tool_calls",
+        "prediction", "web_search_options", "store",
+    }
+    stripped_keys = [k for k in list(body.keys()) if k in _openai_only]
+    for k in stripped_keys:
+        body.pop(k, None)
+    if stripped_keys:
+        sys.stdout.write(f"[proxy] stripped openai-only fields: {stripped_keys}\n")
+        sys.stdout.flush()
+
     # 兼容: max_tokens 是 Anthropic 必填字段, 但部分 OpenAI→Anthropic 转换器
     # (如 newapi 中转的 Cherry Studio OpenAI 格式请求) 会漏掉这个字段, 兜底补一个
     if "max_tokens" not in body or not isinstance(body.get("max_tokens"), int):
