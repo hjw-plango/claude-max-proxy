@@ -386,6 +386,13 @@ def proxy_messages():
     except Exception as e:
         return {"error": str(e)}, 400
 
+    # 兼容: max_tokens 是 Anthropic 必填字段, 但部分 OpenAI→Anthropic 转换器
+    # (如 newapi 中转的 Cherry Studio OpenAI 格式请求) 会漏掉这个字段, 兜底补一个
+    if "max_tokens" not in body or not isinstance(body.get("max_tokens"), int):
+        body["max_tokens"] = 4096
+        sys.stdout.write("[proxy] max_tokens missing in body, defaulted to 4096\n")
+        sys.stdout.flush()
+
     # 兼容: 客户端可能把 role="system" 内联在 messages 数组里(OpenAI 习惯)
     # Anthropic 不接受,本地合并到顶层 system 字段,避免无效请求打上游
     sys_msgs = [m for m in body.get("messages", []) if isinstance(m, dict) and m.get("role") == "system"]
