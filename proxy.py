@@ -468,6 +468,30 @@ def proxy_messages():
         sys.stdout.write("[proxy] max_tokens missing in body, defaulted to 4096\n")
         sys.stdout.flush()
 
+    # 兼容: 把 OpenAI 格式的 tools 转成 Anthropic 格式
+    #   OpenAI: {"type":"function","function":{name, description, parameters}}
+    #   Anthropic: {"name":..., "description":..., "input_schema":...}
+    # newapi 中转 Hermes/Cherry 的 OpenAI 请求时常常漏掉这步转换, 透传到 Anthropic 会 400.
+    # 必须放在 detect_client / replace_tools 之前, 否则 tool name 全是 None, hermes 识别失败.
+    if isinstance(body.get("tools"), list):
+        normalized = []
+        converted = 0
+        for t in body["tools"]:
+            if isinstance(t, dict) and t.get("type") == "function" and isinstance(t.get("function"), dict):
+                fn = t["function"]
+                normalized.append({
+                    "name": fn.get("name", ""),
+                    "description": fn.get("description", ""),
+                    "input_schema": fn.get("parameters", {"type": "object", "properties": {}}),
+                })
+                converted += 1
+            else:
+                normalized.append(t)
+        if converted:
+            body["tools"] = normalized
+            sys.stdout.write(f"[proxy] normalized {converted} OpenAI-format tool(s) to Anthropic format\n")
+            sys.stdout.flush()
+
     # 兼容: 客户端可能把 role="system" 内联在 messages 数组里(OpenAI 习惯)
     # Anthropic 不接受,本地合并到顶层 system 字段,避免无效请求打上游
     sys_msgs = [m for m in body.get("messages", []) if isinstance(m, dict) and m.get("role") == "system"]
