@@ -214,6 +214,9 @@ HERMES_TO_CC = _mapping.get("hermes", {})
 CC_TO_OC = {v: k for k, v in OC_TO_CC.items()}
 CC_TO_HERMES = {v: k for k, v in HERMES_TO_CC.items()}
 
+# CC 原生 + Anthropic Cowork 内置 MCP 工具白名单 (从 mapping 表 value 端推导, 不在此名单的全部借壳)
+CC_NATIVE_TOOLS = set(OC_TO_CC.values()) | set(HERMES_TO_CC.values())
+
 # 加载 Cowork application_details 模板 — 非 CC 客户端伪装成 Cowork 模式时塞进 system[2]
 # 文件不入 git (含 Anthropic 内部 prompt), 部署时本地脱敏后填入, 见 cc_cowork_template.txt.example
 _TEMPLATE_FILE = os.path.join(os.path.dirname(__file__), "cc_cowork_template.txt")
@@ -246,17 +249,18 @@ def detect_client(body: dict) -> str:
         return "hermes"
     return "openclaw"
 
-def replace_tools(body: dict, cc_client: bool = False, client_type: str = "openclaw") -> None:
-    """替换 tool 名称：移除不需要的，把 OC|Hermes 名改成 CC 名，保留原始 schema
-    按特征分流: 真 CC client 自己 tools 已合规,不映射"""
+def replace_tools(body: dict, cc_client: bool = False, client_type: str = "openclaw") -> dict:
+    """替换 tool 名称, 返回运行时借壳映射 (new_name -> original_name) 供响应反向使用.
+    按特征分流: 真 CC client 自己 tools 已合规, 不映射, 返回空 dict."""
     if cc_client:
-        return  # CC client 自带的 tools 是 Anthropic 合规的,不动
+        return {}  # CC client 自带的 tools 是 Anthropic 合规的,不动
     tools = body.get("tools")
     if not tools:
-        return
+        return {}
 
     table = HERMES_TO_CC if client_type == "hermes" else OC_TO_CC
     new_tools = []
+    runtime_borrow = {}  # new_name -> original_name, 用于响应反向映射
     for t in tools:
         name = t.get("name")
         # server-side tool (web_search_20250305 / code_execution_* / bash_* / computer_* / text_editor_* 等)
@@ -267,16 +271,33 @@ def replace_tools(body: dict, cc_client: bool = False, client_type: str = "openc
             continue
         if name in REMOVE_TOOLS:
             continue
+        # 显式映射表 (OC_TO_CC / HERMES_TO_CC)
         if name in table:
             t = {**t, "name": table[name]}
+            new_tools.append(t)
+            continue
+        # 已是 CC 原生 tool 名或 Cowork 内置 mcp__claude_ai_* 前缀: 透传
+        if not name or name in CC_NATIVE_TOOLS or name.startswith("mcp__claude_ai_"):
+            new_tools.append(t)
+            continue
+        # 兜底借壳: 任何其他 tool name (含 mcp_wecom_*、自定义业务工具、未知 MCP 等)
+        # 改成 Cowork 内置 MCP 风格 (mcp__claude_ai_<原名>), schema 完全保留, 模型读 description 仍能用.
+        # 让 Anthropic 视角看到的 tools 名单像"Cowork 用户接了一堆官方 MCP", 不暴露业务身份.
+        new_name = f"mcp__claude_ai_{name}"
+        # 防御性: 如果撞名 (理论上原 name 唯一 -> 新名也唯一), 跳过借壳
+        if new_name not in runtime_borrow and new_name not in CC_NATIVE_TOOLS:
+            runtime_borrow[new_name] = name
+            t = {**t, "name": new_name}
         new_tools.append(t)
 
     # 真 CC 的 tools baseline 不带 cache_control(cache 全在 system 端) — 这里也不加,
     # 既匹配真实 CC 行为(避免 fingerprint), 又给后续 proxy 注入的 system cache_control 让出额度
     body["tools"] = new_tools
-    sys.stdout.write(f"[proxy] tools: {len(new_tools)} mapped (removed {len(tools) - len(new_tools)}), "
+    sys.stdout.write(f"[proxy] tools: {len(new_tools)} mapped (removed {len(tools) - len(new_tools)}, "
+                     f"borrowed {len(runtime_borrow)}), "
                      f"names={[t.get('name', t.get('type', '?')) for t in new_tools]}\n")
     sys.stdout.flush()
+    return runtime_borrow
 
 def inject_system_and_cch(body: dict, cc_client: bool = False) -> bytes:
     """注入 Claude Code 的 system prompts + 计算 cch 签名
@@ -560,7 +581,7 @@ def proxy_messages():
             sys.stdout.write(f"[proxy] header dump failed: {_e}\n")
             sys.stdout.flush()
 
-    replace_tools(body, cc_client=cc_client, client_type=client_type)
+    runtime_borrow = replace_tools(body, cc_client=cc_client, client_type=client_type)
     body_bytes = inject_system_and_cch(body, cc_client=cc_client)
     headers = build_headers(access_token, session_id=incoming_session_id)
     # 透传客户端 anthropic-beta — 否则 body 里 context_management 等字段会被 Anthropic 拒
@@ -602,15 +623,20 @@ def proxy_messages():
     sys.stdout.flush()
 
     def remap_tool_names(data: bytes) -> bytes:
-        """把响应中的 CC tool 名替换回 client 原本的 tool 名
+        """把响应中的 CC / 借壳 tool 名替换回 client 原本的 tool 名
         按特征分流: CC client 自己用 CC 名,不需要反映射"""
         if cc_client:
             return data
         rev_table = CC_TO_HERMES if client_type == "hermes" else CC_TO_OC
         text = data.decode("utf-8", errors="replace")
+        # 1) 显式映射表反向 (例如 Bash -> exec / Edit -> edit)
         for cc_name, original in rev_table.items():
             text = text.replace(f'"name":"{cc_name}"', f'"name":"{original}"')
             text = text.replace(f'"name": "{cc_name}"', f'"name": "{original}"')
+        # 2) 运行时借壳反向 (例如 mcp__claude_ai_wecom_docs_create_doc -> mcp_wecom_docs_create_doc)
+        for borrowed_name, original_name in runtime_borrow.items():
+            text = text.replace(f'"name":"{borrowed_name}"', f'"name":"{original_name}"')
+            text = text.replace(f'"name": "{borrowed_name}"', f'"name": "{original_name}"')
         return text.encode("utf-8")
 
     if is_stream:
