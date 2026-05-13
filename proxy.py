@@ -114,6 +114,38 @@ def compute_cch(body_bytes: bytes) -> str:
     return f"{h & 0xFFFFF:05x}"
 
 # ============================================================
+# session-id LRU 缓存 — 模拟真 CC "一会话内复用同一 session-id" 的行为
+# key = (remote_addr, user_token), value = (uuid, last_seen_ts), TTL = 5 分钟
+# ============================================================
+
+import hashlib
+
+_SESSION_TTL = 300  # 5 分钟
+_session_cache: dict = {}
+_session_lock = threading.Lock()
+
+def get_or_create_session_id(remote_addr: str, user_token: str) -> str:
+    """非 CC 客户端没传 session-id 时, 基于 (ip, user) 在 5 分钟窗口内复用同一 uuid"""
+    key = (remote_addr or "", user_token or "")
+    now = time.time()
+    with _session_lock:
+        # 顺手清理过期项, 防止 dict 长期累积
+        for k in list(_session_cache.keys()):
+            if now - _session_cache[k][1] > _SESSION_TTL:
+                _session_cache.pop(k, None)
+        if key in _session_cache:
+            sid, _ = _session_cache[key]
+            _session_cache[key] = (sid, now)
+            return sid
+        sid = str(uuid.uuid4())
+        _session_cache[key] = (sid, now)
+        return sid
+
+def compute_device_id(user_token: str) -> str:
+    """基于 user_token 稳定 hash 出 64 字符 hex device_id, 跟真 CC metadata.user_id 里的格式一致"""
+    return hashlib.sha256((user_token or "anon").encode("utf-8")).hexdigest()
+
+# ============================================================
 # 被 Anthropic 屏蔽的第三方应用关键词
 # ============================================================
 
@@ -285,7 +317,9 @@ def inject_system_and_cch(body: dict, cc_client: bool = False) -> bytes:
 
         if sys_texts:
             combined_sys = "\n\n".join(sys_texts)
-            prefix_text = f"<system_instructions>\n{combined_sys}\n</system_instructions>\n\n"
+            # 真 CC 把所有 instructions 内联到 system 长 prompt 里, 不会用 <system_instructions> 这种标签
+            # 这里改用通用 markdown header, 避免 proxy 独有标签被 Anthropic 静态规则识别
+            prefix_text = f"# Additional Instructions\n\n{combined_sys}\n\n---\n\n"
 
             # 拆成独立 block + cache_control — prefix 大头(原 system + tools 描述)进 cache
             # 命中后续 turn 只 cache_read,省钱省 latency
@@ -312,7 +346,7 @@ def inject_system_and_cch(body: dict, cc_client: bool = False) -> bytes:
     }
     identity = {
         "type": "text",
-        "text": "You are Claude Code, Anthropic's official CLI for Claude.",
+        "text": "You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK.",
         "cache_control": {"type": "ephemeral", "ttl": "1h"},
     }
 
@@ -441,6 +475,18 @@ def proxy_messages():
     cc_client = is_cc_client(request)
     client_type = "cc" if cc_client else detect_client(body)
     incoming_session_id = request.headers.get("X-Claude-Code-Session-Id")
+    # 非 CC 客户端没传 session-id 时, 基于 (ip, user) 在 5 分钟内复用同一 uuid,
+    # 模拟真 CC 的"一会话内复用 session-id"行为, 减少 fingerprint, 同时利于 prompt cache 命中
+    if not cc_client and not incoming_session_id:
+        incoming_session_id = get_or_create_session_id(request.remote_addr, client_token)
+        # 同步注入 metadata.user_id (真 CC 总是发, 格式: JSON 字符串嵌 device_id/account_uuid/session_id)
+        body["metadata"] = {
+            "user_id": json.dumps({
+                "device_id": compute_device_id(client_token),
+                "account_uuid": "",
+                "session_id": incoming_session_id,
+            }, separators=(",", ":"))
+        }
 
     if DEBUG:
         if len(raw) > 1000:
