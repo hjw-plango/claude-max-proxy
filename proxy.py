@@ -297,6 +297,24 @@ def replace_tools(body: dict, cc_client: bool = False, client_type: str = "openc
                      f"borrowed {len(runtime_borrow)}), "
                      f"names={[t.get('name', t.get('type', '?')) for t in new_tools]}\n")
     sys.stdout.flush()
+
+    # messages 里历史 tool_use.name 也要同步改名, 保持跟 tools 数组一致.
+    # 否则 Anthropic 看到 tools 里没有 "mcp_wecom_*" 但 history 里出现, 会报 tool not found.
+    original_to_new = {v: k for k, v in runtime_borrow.items()}  # 反转: original -> borrowed
+    full_remap = {**table, **original_to_new}  # 客户端原名 -> 上游应该看到的名
+    if full_remap:
+        for msg in body.get("messages", []):
+            if not isinstance(msg, dict):
+                continue
+            content = msg.get("content")
+            if not isinstance(content, list):
+                continue
+            for blk in content:
+                if isinstance(blk, dict) and blk.get("type") == "tool_use":
+                    n = blk.get("name")
+                    if n in full_remap:
+                        blk["name"] = full_remap[n]
+
     return runtime_borrow
 
 def inject_system_and_cch(body: dict, cc_client: bool = False) -> bytes:
@@ -534,6 +552,65 @@ def proxy_messages():
         body["system"] = existing + extra_blocks
         sys.stdout.write(f"[proxy] inlined-system normalized: moved {len(sys_msgs)} msg(s) to top-level\n")
         sys.stdout.flush()
+
+    # 兼容: 把 OpenAI 协议的 role=tool 和 assistant.tool_calls 转成 Anthropic 协议
+    #   OpenAI tool result:     {"role":"tool","tool_call_id":"X","content":"..."}
+    #   Anthropic 等价:          {"role":"user","content":[{"type":"tool_result","tool_use_id":"X","content":"..."}]}
+    #
+    #   OpenAI assistant call:  {"role":"assistant","content":"...","tool_calls":[{"id":"X","type":"function","function":{"name":"n","arguments":"{...}"}}]}
+    #   Anthropic 等价:          {"role":"assistant","content":[{"type":"text","text":"..."},{"type":"tool_use","id":"X","name":"n","input":{...}}]}
+    msgs = body.get("messages")
+    if isinstance(msgs, list):
+        new_msgs = []
+        msg_converted = 0
+        for msg in msgs:
+            if not isinstance(msg, dict):
+                new_msgs.append(msg); continue
+            role = msg.get("role")
+            if role == "tool":
+                new_msgs.append({
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": msg.get("tool_call_id", ""),
+                        "content": msg.get("content", ""),
+                    }],
+                })
+                msg_converted += 1
+                continue
+            if role == "assistant" and isinstance(msg.get("tool_calls"), list):
+                new_content = []
+                text = msg.get("content")
+                if isinstance(text, str) and text:
+                    new_content.append({"type": "text", "text": text})
+                elif isinstance(text, list):
+                    for blk in text:
+                        if isinstance(blk, dict):
+                            new_content.append(blk)
+                for tc in msg["tool_calls"]:
+                    if not isinstance(tc, dict):
+                        continue
+                    fn = tc.get("function") or {}
+                    args = fn.get("arguments")
+                    if isinstance(args, str):
+                        try:
+                            args = json.loads(args) if args else {}
+                        except Exception:
+                            args = {}
+                    new_content.append({
+                        "type": "tool_use",
+                        "id": tc.get("id", ""),
+                        "name": fn.get("name", ""),
+                        "input": args or {},
+                    })
+                new_msgs.append({"role": "assistant", "content": new_content})
+                msg_converted += 1
+                continue
+            new_msgs.append(msg)
+        if msg_converted:
+            body["messages"] = new_msgs
+            sys.stdout.write(f"[proxy] normalized {msg_converted} OpenAI-style tool/assistant message(s)\n")
+            sys.stdout.flush()
 
     access_token = get_access_token()
     cc_client = is_cc_client(request)
