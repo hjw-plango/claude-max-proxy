@@ -612,6 +612,22 @@ def proxy_messages():
             sys.stdout.write(f"[proxy] normalized {msg_converted} OpenAI-style tool/assistant message(s)\n")
             sys.stdout.flush()
 
+        # 再扫一遍 messages 数组, 剥掉每条 message 里的 OpenAI-only 字段
+        # (reasoning_content/refusal/audio/function_call/name/tool_call_id/tool_calls 等).
+        # 这些字段 Anthropic 拒收, 例如 DeepSeek R1 / OpenAI o1 SDK 会在 assistant message 加 reasoning_content.
+        _msg_strip = {"reasoning_content", "refusal", "audio", "function_call", "name", "tool_call_id", "tool_calls"}
+        msg_field_stripped = 0
+        for msg in body.get("messages", []):
+            if not isinstance(msg, dict):
+                continue
+            for k in list(msg.keys()):
+                if k in _msg_strip:
+                    msg.pop(k, None)
+                    msg_field_stripped += 1
+        if msg_field_stripped:
+            sys.stdout.write(f"[proxy] stripped {msg_field_stripped} OpenAI-only field(s) from messages\n")
+            sys.stdout.flush()
+
     access_token = get_access_token()
     cc_client = is_cc_client(request)
     client_type = "cc" if cc_client else detect_client(body)
