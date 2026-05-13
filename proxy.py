@@ -214,6 +214,12 @@ def replace_tools(body: dict, cc_client: bool = False, client_type: str = "openc
     new_tools = []
     for t in tools:
         name = t.get("name")
+        # server-side tool (web_search_20250305 / code_execution_* / bash_* / computer_* / text_editor_* 等)
+        # 有 "type" 字段, name 是 Anthropic 约定的固定字面量(如 type=web_search_20250305 必须 name=web_search),
+        # 改名会导致 400. 此类 tool 不做 remove / rename, 直接透传.
+        if "type" in t and t.get("type"):
+            new_tools.append(t)
+            continue
         if name in REMOVE_TOOLS:
             continue
         if name in table:
