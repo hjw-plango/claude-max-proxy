@@ -1,0 +1,55 @@
+# Cowork application_details 模板
+
+非 CC 客户端经 proxy 时, 会被伪装成 Claude 桌面 Cowork 模式的请求.
+其 `system[2]` 是一段 ~60KB 的 Cowork `application_details` 内容
+(描述 Cowork 模式的产品行为、工具使用规则、memory 系统等).
+
+这段模板**不在公开仓库里** (含 Anthropic 内部 prompt, 不便分发).
+你需要自己抓一份本地版本.
+
+## 抓取步骤
+
+1. 启用 DEBUG, 重启代理:
+   ```bash
+   sudo sed -i 's/^# *DEBUG=1/DEBUG=1/' /etc/claude-max-proxy.env
+   sudo systemctl restart claude-max-proxy
+   ```
+
+2. 用 Claude 桌面应用 (https://claude.ai/download) 的 Cowork 模式发一次对话,
+   API 路由经过本 proxy. 触发后代理会在 service 私有 `/tmp/` 下 dump body.
+
+3. 读取 dump (PID 替换为代理实际 PID):
+   ```bash
+   PID=$(systemctl show -p MainPID --value claude-max-proxy)
+   python3 -c "
+   import json
+   d = json.load(open(f'/proc/${PID}/root/tmp/proxy_neo_raw.json'))
+   # Cowork 是 3-block, system[2] 是 application_details
+   for i, b in enumerate(d['system']):
+     t = b.get('text','')
+     if 'application_details' in t[:50]:
+       open('cc_cowork_template.txt', 'w').write(t)
+       print(f'Saved {len(t)} chars from system[{i}]')
+       break
+   "
+   ```
+
+4. **脱敏**: 模板里 macOS 用户名和 session UUID 是真实值, 必须替换:
+   ```bash
+   sed -i \
+     -e 's|/Users/[a-zA-Z][a-zA-Z0-9-]*|/Users/user|g' \
+     cc_cowork_template.txt
+   # session UUID 用 grep 找出真实值, 手动替换为占位 (例如 11111111-1111-4111-8111-111111111111)
+   ```
+
+5. 关 DEBUG, 重启:
+   ```bash
+   sudo sed -i 's/^DEBUG=1/# DEBUG=1/' /etc/claude-max-proxy.env
+   sudo systemctl restart claude-max-proxy
+   ```
+
+## 文件未提供时代理行为
+
+`inject_system_and_cch` 加载模板失败会 fallback 到一段简短 stub
+(仅含 `<application_details>...</application_details>` 包装), 这降低了伪装质量
+但不影响请求成功. 强烈建议补齐模板.

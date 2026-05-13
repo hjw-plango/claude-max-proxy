@@ -9,3 +9,6 @@ proxy.log
 .env
 .env.*
 /tmp/proxy_*
+
+# Cowork application_details 模板 (含 Anthropic 内部 prompt, 本地脱敏后填入, 不入公开仓库)
+cc_cowork_template.txt
