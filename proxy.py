@@ -315,6 +315,14 @@ def replace_tools(body: dict, cc_client: bool = False, client_type: str = "openc
                     if n in full_remap:
                         blk["name"] = full_remap[n]
 
+    # tool_choice.name 也要同步改名 (Anthropic 校验 tool_choice 必须指向 tools 数组里存在的 name).
+    # 常见场景: agent 用 tool_choice={type:tool,name:X} 强制结构化输出 (LangChain/LangGraph 等).
+    tc = body.get("tool_choice")
+    if isinstance(tc, dict) and tc.get("type") == "tool":
+        tc_name = tc.get("name")
+        if tc_name and tc_name in full_remap:
+            tc["name"] = full_remap[tc_name]
+
     return runtime_borrow
 
 def inject_system_and_cch(body: dict, cc_client: bool = False) -> bytes:
