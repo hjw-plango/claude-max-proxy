@@ -648,11 +648,27 @@ def proxy_messages():
             }
     # 兜底 output_config / thinking — 真 Cowork 总是带这两个字段, 缺失也是 fingerprint.
     # 仅非 CC 客户端注入, 且客户端未传时才填默认值. haiku 不支持 thinking, 整组都跳过.
+    # 另: Anthropic 硬约束 — tool_choice 强制工具使用时不能开 thinking, 此时跳过 thinking 注入,
+    # 否则会撞 'Thinking may not be enabled when tool_choice forces tool use.' 400.
     if not cc_client and "haiku" not in body.get("model", "").lower():
         if "output_config" not in body:
             body["output_config"] = {"effort": "medium"}
         if "thinking" not in body:
-            body["thinking"] = {"type": "adaptive"}
+            tc = body.get("tool_choice")
+            force_tool = False
+            if isinstance(tc, dict):
+                # Anthropic 风格: {"type": "any"} 或 {"type": "tool", "name": "..."}
+                if tc.get("type") in ("any", "tool"):
+                    force_tool = True
+            elif isinstance(tc, str):
+                # OpenAI 风格: "required" 强制使用工具
+                if tc == "required":
+                    force_tool = True
+            if not force_tool:
+                body["thinking"] = {"type": "adaptive"}
+            else:
+                sys.stdout.write("[proxy] skipped thinking injection (tool_choice forces tool use)\n")
+                sys.stdout.flush()
 
     if DEBUG:
         if len(raw) > 1000:
