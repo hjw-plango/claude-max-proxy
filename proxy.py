@@ -298,32 +298,82 @@ def replace_tools(body: dict, cc_client: bool = False, client_type: str = "openc
                      f"names={[t.get('name', t.get('type', '?')) for t in new_tools]}\n")
     sys.stdout.flush()
 
-    # messages 里历史 tool_use.name 也要同步改名, 保持跟 tools 数组一致.
-    # 否则 Anthropic 看到 tools 里没有 "mcp_wecom_*" 但 history 里出现, 会报 tool not found.
+    # 把"客户端原 name → Anthropic 应看到的 name"映射统一应用到 body 各处.
+    # tools 数组本身已在循环里改完, 这里负责其他可能引用 tool name 的位置.
     original_to_new = {v: k for k, v in runtime_borrow.items()}  # 反转: original -> borrowed
-    full_remap = {**table, **original_to_new}  # 客户端原名 -> 上游应该看到的名
+    full_remap = {**table, **original_to_new}
     if full_remap:
-        for msg in body.get("messages", []):
-            if not isinstance(msg, dict):
-                continue
-            content = msg.get("content")
-            if not isinstance(content, list):
-                continue
-            for blk in content:
-                if isinstance(blk, dict) and blk.get("type") == "tool_use":
-                    n = blk.get("name")
-                    if n in full_remap:
-                        blk["name"] = full_remap[n]
-
-    # tool_choice.name 也要同步改名 (Anthropic 校验 tool_choice 必须指向 tools 数组里存在的 name).
-    # 常见场景: agent 用 tool_choice={type:tool,name:X} 强制结构化输出 (LangChain/LangGraph 等).
-    tc = body.get("tool_choice")
-    if isinstance(tc, dict) and tc.get("type") == "tool":
-        tc_name = tc.get("name")
-        if tc_name and tc_name in full_remap:
-            tc["name"] = full_remap[tc_name]
+        _apply_tool_name_remap(body, full_remap)
 
     return runtime_borrow
+
+def _apply_tool_name_remap(body: dict, full_remap: dict) -> None:
+    """统一改写 body 里所有引用 tool name 的位置, 保持跟 tools 数组一致.
+    Anthropic 对 tool name 一致性校验非常严格 — tools 改了名, body 里任何引用都得同步,
+    否则 'Tool X not found in provided tools' 或 'unexpected name' 类 400.
+
+    已知引用点:
+      1. tool_choice.name          (Anthropic / agent 强制工具选择)
+      2. messages[].content[].name (assistant 历史的 tool_use block)
+      3. system 里可能内联工具名 — 这里不动 system, 避免破坏语义
+
+    防御性递归扫: 兜底任何"看起来是 tool 引用结构"的 dict
+      启发式: dict 同时含 'name' (在 full_remap 内) + 以下任一明确 tool 信号:
+        - 'input_schema' (tool definition)
+        - type='tool_use' / type='tool' (block 或 tool_choice)
+        - 'input' 且 'id' (tool_use block 的剩余特征)
+      满足才改, 避免误伤 messages 里的纯文本内容.
+    """
+    if not full_remap:
+        return
+
+    # ① 显式: tool_choice
+    tc = body.get("tool_choice")
+    if isinstance(tc, dict) and tc.get("type") == "tool":
+        n = tc.get("name")
+        if n in full_remap:
+            tc["name"] = full_remap[n]
+
+    # ② 显式: messages[].content[] 里的 tool_use blocks
+    for msg in body.get("messages", []) or []:
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for blk in content:
+            if isinstance(blk, dict) and blk.get("type") == "tool_use":
+                n = blk.get("name")
+                if n in full_remap:
+                    blk["name"] = full_remap[n]
+
+    # ③ 防御性递归: 兜底任何形似 tool 引用的结构 (跳过 system / metadata 避免误伤文本)
+    def _looks_like_tool_ref(d: dict) -> bool:
+        if "input_schema" in d:                            # tool definition
+            return True
+        t = d.get("type")
+        if t in ("tool_use", "tool"):                      # tool_use block / tool_choice
+            return True
+        if "input" in d and "id" in d and "name" in d:     # tool_use block 剩余特征
+            return True
+        return False
+
+    def _walk(obj):
+        if isinstance(obj, dict):
+            n = obj.get("name")
+            if isinstance(n, str) and n in full_remap and _looks_like_tool_ref(obj):
+                obj["name"] = full_remap[n]
+            for v in obj.values():
+                _walk(v)
+        elif isinstance(obj, list):
+            for v in obj:
+                _walk(v)
+
+    # 只递归 messages / tools / tool_choice 等"可能含 tool 引用"的顶层字段,
+    # 不扫 system / metadata / context_management 等 (那些不该含 tool name 引用, 也防误伤).
+    for key in ("messages", "tools", "tool_choice"):
+        if key in body:
+            _walk(body[key])
 
 def inject_system_and_cch(body: dict, cc_client: bool = False) -> bytes:
     """注入 Claude Code 的 system prompts + 计算 cch 签名
