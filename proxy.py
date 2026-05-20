@@ -690,6 +690,17 @@ def proxy_messages():
     cc_client = is_cc_client(request)
     client_type = "cc" if cc_client else detect_client(body)
     incoming_session_id = request.headers.get("X-Claude-Code-Session-Id")
+    # 真 Cowork body 顶层不含 temperature/top_p/top_k, 新版 Claude (opus-4-7 等) 也已 deprecate
+    # 这些采样参数. 客户端传了会撞 'X is deprecated for this model' 400, 或与 proxy 注入的 thinking
+    # 冲突. 非 CC 客户端统一剥掉, 让模型使用默认采样策略.
+    if not cc_client:
+        _sampling_keys = ("temperature", "top_p", "top_k")
+        _stripped_sampling = [k for k in _sampling_keys if k in body]
+        for k in _stripped_sampling:
+            body.pop(k, None)
+        if _stripped_sampling:
+            sys.stdout.write(f"[proxy] stripped deprecated sampling params: {_stripped_sampling}\n")
+            sys.stdout.flush()
     # 非 CC 客户端没传 session-id 时, 基于 (ip, user) 在 5 分钟内复用同一 uuid,
     # 模拟真 CC 的"一会话内复用 session-id"行为, 减少 fingerprint, 同时利于 prompt cache 命中
     if not cc_client and not incoming_session_id:
@@ -712,20 +723,36 @@ def proxy_messages():
         if "output_config" not in body:
             body["output_config"] = {"effort": "medium"}
         if "thinking" not in body:
+            # Anthropic 硬约束 — thinking 注入会和以下场景冲突:
+            #   ① tool_choice 强制工具使用 (any/tool/"required") → 'Thinking may not be enabled when tool_choice forces tool use.'
+            #   ② temperature 不是 1 (常见 0.7 等值)             → 'temperature may only be set to 1 when thinking is enabled or in adaptive mode.'
+            #   ③ top_p / top_k 显式设置                         → 类似限制
+            skip_reason = None
+
+            # ① tool_choice 强制工具
             tc = body.get("tool_choice")
-            force_tool = False
-            if isinstance(tc, dict):
-                # Anthropic 风格: {"type": "any"} 或 {"type": "tool", "name": "..."}
-                if tc.get("type") in ("any", "tool"):
-                    force_tool = True
-            elif isinstance(tc, str):
-                # OpenAI 风格: "required" 强制使用工具
-                if tc == "required":
-                    force_tool = True
-            if not force_tool:
+            if isinstance(tc, dict) and tc.get("type") in ("any", "tool"):
+                skip_reason = "tool_choice forces tool use"
+            elif isinstance(tc, str) and tc == "required":
+                skip_reason = "tool_choice forces tool use"
+
+            # ② temperature 不是 1
+            if skip_reason is None:
+                temp = body.get("temperature")
+                if isinstance(temp, (int, float)) and temp != 1:
+                    skip_reason = f"temperature={temp} (thinking requires 1)"
+
+            # ③ top_p / top_k 显式设置 (跟 thinking 互斥)
+            if skip_reason is None:
+                if "top_p" in body and body["top_p"] is not None:
+                    skip_reason = "top_p set (incompatible with thinking)"
+                elif "top_k" in body and body["top_k"] is not None:
+                    skip_reason = "top_k set (incompatible with thinking)"
+
+            if skip_reason is None:
                 body["thinking"] = {"type": "adaptive"}
             else:
-                sys.stdout.write("[proxy] skipped thinking injection (tool_choice forces tool use)\n")
+                sys.stdout.write(f"[proxy] skipped thinking injection ({skip_reason})\n")
                 sys.stdout.flush()
 
     if DEBUG:
