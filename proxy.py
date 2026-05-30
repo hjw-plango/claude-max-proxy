@@ -804,12 +804,45 @@ def proxy_messages():
             sys.stdout.write(f"[proxy] header dump failed: {_e}\n")
             sys.stdout.flush()
 
+    # thinking/redacted_thinking block 带密码学签名. 经多层中转 (newapi 等) 时, 即便"透传",
+    # 底层 JSON round-trip (Go json.Marshal 默认按字母序重排 map key / unicode 转义变化) 也会
+    # 改变 block 字节, signature 失效 → 'thinking blocks cannot be modified' 400.
+    # Anthropic 多轮非工具对话不强制回传历史 thinking, 故主动剥离规避.
+    # 例外: tool-use 循环等待态 (最后一条是 user 的 tool_result) 必须保留 thinking, 不剥.
+    msgs = body.get("messages") or []
+    pending_tool = False
+    if msgs:
+        last = msgs[-1]
+        if isinstance(last, dict) and last.get("role") == "user":
+            lc = last.get("content")
+            if isinstance(lc, list) and any(
+                isinstance(b, dict) and b.get("type") == "tool_result" for b in lc
+            ):
+                pending_tool = True
+    thinking_stripped = 0
+    if not pending_tool:
+        for m in msgs:
+            if isinstance(m, dict) and m.get("role") == "assistant":
+                c = m.get("content")
+                if isinstance(c, list):
+                    nc = [b for b in c if not (isinstance(b, dict)
+                          and b.get("type") in ("thinking", "redacted_thinking"))]
+                    # 剥离后非空才应用, 避免 assistant content 变空被 Anthropic 拒
+                    if nc and len(nc) != len(c):
+                        thinking_stripped += len(c) - len(nc)
+                        m["content"] = nc
+    if thinking_stripped:
+        sys.stdout.write(f"[proxy] stripped {thinking_stripped} stale thinking block(s) from history\n")
+        sys.stdout.flush()
+
     if cc_client:
-        # 真 CC 客户端 body 已合规 — 用原始请求字节转发, 不做 json.loads→dumps round-trip.
-        # 原因: thinking/redacted_thinking block 带签名, round-trip 改变字节表示 (key 顺序 /
-        # unicode 转义 / 空格) 会让 signature 失效, 报 'thinking blocks cannot be modified'.
-        # 同时保留客户端自己算的 cch, proxy 不该重算. proxy 对 CC 只改 header (加 OAuth).
-        body_bytes = request.get_data()
+        # 真 CC 客户端 body 已合规 — 默认用原始请求字节转发, 不做 round-trip (保护 thinking 签名,
+        # 保留客户端自己算的 cch). 但若上面剥离了 stale thinking, body 已改, 必须重新序列化
+        # (此时 thinking 已删, round-trip 不再有签名风险).
+        if thinking_stripped:
+            body_bytes = json.dumps(body, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        else:
+            body_bytes = request.get_data()
         runtime_borrow = {}
     else:
         runtime_borrow = replace_tools(body, cc_client=cc_client, client_type=client_type)
