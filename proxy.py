@@ -804,8 +804,16 @@ def proxy_messages():
             sys.stdout.write(f"[proxy] header dump failed: {_e}\n")
             sys.stdout.flush()
 
-    runtime_borrow = replace_tools(body, cc_client=cc_client, client_type=client_type)
-    body_bytes = inject_system_and_cch(body, cc_client=cc_client)
+    if cc_client:
+        # 真 CC 客户端 body 已合规 — 用原始请求字节转发, 不做 json.loads→dumps round-trip.
+        # 原因: thinking/redacted_thinking block 带签名, round-trip 改变字节表示 (key 顺序 /
+        # unicode 转义 / 空格) 会让 signature 失效, 报 'thinking blocks cannot be modified'.
+        # 同时保留客户端自己算的 cch, proxy 不该重算. proxy 对 CC 只改 header (加 OAuth).
+        body_bytes = request.get_data()
+        runtime_borrow = {}
+    else:
+        runtime_borrow = replace_tools(body, cc_client=cc_client, client_type=client_type)
+        body_bytes = inject_system_and_cch(body, cc_client=cc_client)
     headers = build_headers(access_token, session_id=incoming_session_id)
     # 透传客户端 anthropic-beta — 否则 body 里 context_management 等字段会被 Anthropic 拒
     client_beta = request.headers.get("Anthropic-Beta", "").strip()
