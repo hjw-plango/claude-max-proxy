@@ -468,10 +468,39 @@ def inject_system_and_cch(body: dict, cc_client: bool = False) -> bytes:
 
     body["system"] = [billing, identity, application_details]
 
+    # thinking / redacted_thinking block 带密码学签名, 内容改一个字符 signature 即失效,
+    # Anthropic 报 'thinking ... blocks cannot be modified'. sanitize_body 的全局关键词替换
+    # 可能误伤 thinking 文本里出现的 hermes/openclaw 等词. 这里先把签名相关字段替换成占位符,
+    # sanitize 后再还原, 保证这些 block 字节级不变.
+    _think_protect = []  # [(token, original_value), ...]
+    def _protect_thinking(obj):
+        if isinstance(obj, dict):
+            if obj.get("type") in ("thinking", "redacted_thinking"):
+                for field in ("thinking", "signature", "data"):
+                    val = obj.get(field)
+                    if isinstance(val, str):
+                        token = f"__THINKPROT_{len(_think_protect)}_PROTKNIHT__"
+                        _think_protect.append((token, val))
+                        obj[field] = token
+            else:
+                for v in obj.values():
+                    _protect_thinking(v)
+        elif isinstance(obj, list):
+            for v in obj:
+                _protect_thinking(v)
+    _protect_thinking(body.get("messages", []))
+
     body_str = json.dumps(body, separators=(",", ":"), ensure_ascii=False)
 
     # 启用关键词替换 — scrub 第三方 client 标识符(hermes/NousResearch/OpenClaw 等)防 Anthropic 扫到
     body_str = sanitize_body(body_str)
+
+    # 还原 thinking block 字段 (用 JSON 转义后的形式塞回字符串, 保证字节级一致)
+    for token, original in _think_protect:
+        body_str = body_str.replace(token, json.dumps(original, ensure_ascii=False)[1:-1])
+    if _think_protect:
+        sys.stdout.write(f"[proxy] protected {len(_think_protect)} thinking block field(s) from sanitize\n")
+        sys.stdout.flush()
 
     body_bytes = body_str.encode("utf-8")
 
